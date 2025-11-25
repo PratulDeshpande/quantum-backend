@@ -1,0 +1,11 @@
+flask
+flask-cors
+numpy
+networkx
+qiskit
+qiskit-algorithms
+qiskit-optimization
+qiskit-ibm-runtime
+dwave-ocean-sdk
+gunicorn
+python-dotenv

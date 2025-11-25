@@ -1,0 +1,1 @@
+web: gunicorn qaoa_backend:app
