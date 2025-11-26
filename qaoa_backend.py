@@ -28,6 +28,7 @@ try:
     from qiskit import transpile
     from qiskit.circuit.library import QAOAAnsatz
     from qiskit_optimization.applications import Tsp
+    from qiskit_optimization.converters import QuadraticProgramToQubo
     from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as IBMSampler
     from qiskit.primitives import StatevectorSampler as LocalSampler
     QISKIT_AVAILABLE = True
@@ -79,7 +80,12 @@ def background_worker(job_id, locations):
                 print(f"Job {job_id}: Sending to IBM Cloud...")
                 tsp = Tsp(dist_matrix)
                 qp = tsp.to_quadratic_program()
-                operator, offset = qp.to_ising()
+                
+                # Fix: Convert constrained QP to unconstrained QUBO
+                converter = QuadraticProgramToQubo()
+                qubo = converter.convert(qp)
+                operator, offset = qubo.to_ising()
+                
                 ansatz = QAOAAnsatz(operator, reps=1)
                 
                 service = QiskitRuntimeService(channel="ibm_quantum", token=IBM_TOKEN)
