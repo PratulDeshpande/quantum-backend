@@ -6,20 +6,16 @@ from flask_cors import CORS
 import networkx as nx
 from dotenv import load_dotenv
 
-# --- SECURITY UPDATE ---
-# Load secrets from the hidden .env file (for local dev)
+# --- CONFIGURATION ---
 load_dotenv()
-
-# Get tokens from environment variables. 
-# If not found, default to None (Simulation Mode).
 IBM_TOKEN = os.getenv("IBM_TOKEN")
 DWAVE_TOKEN = os.getenv("DWAVE_TOKEN")
 
-# --- IMPORTS ---
 app = Flask(__name__)
-CORS(app)
+# Allow CORS for your frontend domain specifically or all
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 1. Qiskit Setup (IBM)
+# --- IMPORTS & SETUP ---
 QISKIT_AVAILABLE = False
 try:
     from qiskit import transpile
@@ -31,18 +27,16 @@ try:
     from qiskit.primitives import StatevectorSampler as LocalSampler
     QISKIT_AVAILABLE = True
 except ImportError:
-    print("⚠️ Qiskit not installed. IBM mode disabled.")
+    print("⚠️ Qiskit not installed.")
 
-# 2. D-Wave Setup (Ocean)
 DWAVE_AVAILABLE = False
 try:
     from dwave.system import LeapHybridSampler
     import dimod
     DWAVE_AVAILABLE = True
 except ImportError:
-    print("⚠️ D-Wave Ocean not installed. D-Wave mode disabled.")
+    print("⚠️ D-Wave not installed.")
 
-# --- HELPERS ---
 def calculate_distance_matrix(locations):
     n = len(locations)
     matrix = np.zeros((n, n))
@@ -55,7 +49,6 @@ def calculate_distance_matrix(locations):
                 matrix[i][j] = dist
     return matrix
 
-# --- IBM WRAPPERS ---
 class ISA_Transpiler_Wrapper:
     def __init__(self, backend, sampler):
         self.backend = backend
@@ -70,108 +63,128 @@ class ISA_Transpiler_Wrapper:
                 transpiled_pubs.append(transpile(pub, self.backend, optimization_level=3))
         return self.sampler.run(transpiled_pubs)
 
-def solve_with_ibm(dist_matrix, num_nodes):
-    tsp = Tsp(dist_matrix)
-    qp = tsp.to_quadratic_program()
-    
-    # Check for Cloud Token
-    if IBM_TOKEN:
-        print("☁️ Connecting to IBM Quantum Cloud...")
+def get_ibm_service(token):
+    try:
+        return QiskitRuntimeService(channel="ibm_quantum", token=token)
+    except:
         try:
-            try:
-                service = QiskitRuntimeService(channel="ibm_quantum", token=IBM_TOKEN)
-            except:
-                service = QiskitRuntimeService(channel="ibm_cloud", token=IBM_TOKEN)
+             return QiskitRuntimeService(channel="ibm_cloud", token=token)
+        except:
+             return QiskitRuntimeService(channel="ibm_quantum")
 
-            backend = service.least_busy(operational=True, simulator=False)
-            print(f"✅ IBM Target: {backend.name}")
-            
-            optimizer = COBYLA(maxiter=1)
-            raw_sampler = IBMSampler(mode=backend)
-            sampler = ISA_Transpiler_Wrapper(backend, raw_sampler)
-            
-            qaoa = QAOA(sampler, optimizer, reps=1)
-            algorithm = MinimumEigenOptimizer(qaoa)
-            result = algorithm.solve(qp)
-            method = f"Real QPU ({backend.name})"
-            
-        except Exception as e:
-            print(f"❌ IBM Cloud Error: {e}")
-            raise e
-    else:
-        print("💻 Using Local Qiskit Simulator (No Token Found)...")
-        optimizer = COBYLA(maxiter=100)
-        sampler = LocalSampler()
-        qaoa = QAOA(sampler, optimizer, reps=1)
-        algorithm = MinimumEigenOptimizer(qaoa)
-        result = algorithm.solve(qp)
-        method = "Local Qiskit Simulator"
+# --- SOLVERS ---
 
-    x = tsp.interpret(result)
-    return list(x), method, result.fval
-
-# --- DWAVE SOLVER ---
 def solve_with_dwave(dist_matrix):
-    print("🌊 Connecting to D-Wave Leap...")
-    # NOTE: D-Wave library automatically looks for DWAVE_API_TOKEN in os.environ
-    # But passing it explicitly is safer for this setup.
+    print("🌊 D-Wave Leap...")
     sampler = LeapHybridSampler(token=DWAVE_TOKEN)
-    
     import dwave_networkx as dnx
     G = nx.from_numpy_array(dist_matrix)
     route = dnx.traveling_salesperson(G, sampler)
-    
-    energy = 0
-    for i in range(len(route)-1):
-        energy += dist_matrix[route[i]][route[i+1]]
-    energy += dist_matrix[route[-1]][route[0]]
-    
-    return route, "D-Wave Quantum Annealer", energy
+    return route, "D-Wave Quantum Annealer"
 
-# --- MAIN ENDPOINT ---
+def solve_with_ibm_cloud(dist_matrix):
+    print("☁️ IBM Cloud...")
+    tsp = Tsp(dist_matrix)
+    qp = tsp.to_quadratic_program()
+    
+    service = get_ibm_service(IBM_TOKEN)
+    backend = service.least_busy(operational=True, simulator=False)
+    print(f"Target: {backend.name}")
+    
+    optimizer = COBYLA(maxiter=1) # Keep strictly 1 for speed/cost
+    raw_sampler = IBMSampler(mode=backend)
+    sampler = ISA_Transpiler_Wrapper(backend, raw_sampler)
+    
+    qaoa = QAOA(sampler, optimizer, reps=1)
+    algo = MinimumEigenOptimizer(qaoa)
+    result = algo.solve(qp)
+    
+    x = tsp.interpret(result)
+    return list(x), f"Real QPU ({backend.name})", result.fval
+
+def solve_with_local_sim(dist_matrix):
+    print("💻 Local Simulator...")
+    tsp = Tsp(dist_matrix)
+    qp = tsp.to_quadratic_program()
+    
+    # MEMORY SAVING SETTINGS:
+    # 1. Low iterations (20 is enough for demo, 100 kills memory)
+    optimizer = COBYLA(maxiter=20) 
+    sampler = LocalSampler()
+    qaoa = QAOA(sampler, optimizer, reps=1)
+    algo = MinimumEigenOptimizer(qaoa)
+    result = algo.solve(qp)
+    
+    x = tsp.interpret(result)
+    return list(x), "Local Qiskit Simulator", result.fval
+
 @app.route('/solve', methods=['POST'])
 def solve_tsp():
-    print("\n--- New Optimization Request ---")
-    data = request.json
-    locations = data.get('locations', [])
-    num_nodes = len(locations)
-    dist_matrix = calculate_distance_matrix(locations)
-
+    print("\n--- Request ---")
     try:
-        # PRIORITY 1: D-WAVE
+        data = request.json
+        locations = data.get('locations', [])
+        num_nodes = len(locations)
+        
+        if num_nodes < 2:
+            return jsonify({'error': 'Need 2+ locations'}), 400
+
+        dist_matrix = calculate_distance_matrix(locations)
+        
+        # --- STRATEGY SELECTION ---
+        
+        # 1. D-WAVE (Best for Production/Stability)
         if DWAVE_AVAILABLE and DWAVE_TOKEN:
             try:
-                route, method, energy = solve_with_dwave(dist_matrix)
-                if 0 in route:
-                     idx_0 = route.index(0)
-                     route = route[idx_0:] + route[:idx_0]
-                return jsonify({'route': route, 'method': method, 'energy': energy})
+                route, method = solve_with_dwave(dist_matrix)
+                return format_response(route, method, 0, dist_matrix)
             except Exception as e:
-                print(f"D-Wave Error: {e}")
+                print(f"D-Wave Failed: {e}")
 
-        # PRIORITY 2: IBM / QISKIT
-        if QISKIT_AVAILABLE and num_nodes <= 4:
-            route, method, energy = solve_with_ibm(dist_matrix, num_nodes)
-            if 0 in route:
-                idx_0 = route.index(0)
-                route = route[idx_0:] + route[:idx_0]
-            return jsonify({'route': route, 'method': method, 'energy': energy})
-        
-        # PRIORITY 3: CLASSICAL FALLBACK
-        else:
-            print("⚠️ Classical Fallback (No tokens or too many nodes)")
-            G = nx.from_numpy_array(dist_matrix)
-            path = nx.approximation.greedy_tsp(G, source=0)
-            if path[0] == path[-1]: path.pop()
-            return jsonify({'route': path, 'method': 'Classical Greedy', 'energy': 0})
+        # 2. IBM CLOUD (Real Hardware)
+        # We allow up to 4 nodes because the processing happens on THEIR cloud, not our RAM.
+        if QISKIT_AVAILABLE and IBM_TOKEN and num_nodes <= 4:
+            try:
+                route, method, energy = solve_with_ibm_cloud(dist_matrix)
+                return format_response(route, method, energy, dist_matrix)
+            except Exception as e:
+                print(f"IBM Cloud Failed: {e}")
+
+        # 3. LOCAL SIMULATOR (The RAM Killer)
+        # CRITICAL: Strictly limit to 3 nodes on Free Tier RAM.
+        # 4 nodes creates a 16x16 matrix (2^16 states in complex space), often causing OOM.
+        if QISKIT_AVAILABLE and num_nodes <= 3: 
+            try:
+                route, method, energy = solve_with_local_sim(dist_matrix)
+                return format_response(route, method, energy, dist_matrix)
+            except Exception as e:
+                print(f"Sim Failed: {e}")
+
+        # 4. CLASSICAL FALLBACK (Safe Mode)
+        print("⚠️ Using Classical Fallback (Memory Safe)")
+        G = nx.from_numpy_array(dist_matrix)
+        route = nx.approximation.greedy_tsp(G, source=0)
+        return format_response(route, "Classical Greedy (Memory Safe)", 0, dist_matrix)
 
     except Exception as e:
-        print(f"❌ Error: {e}")
-        G = nx.from_numpy_array(dist_matrix)
-        path = nx.approximation.greedy_tsp(G, source=0)
-        if path[0] == path[-1]: path.pop()
-        return jsonify({'route': path, 'method': 'Error Recovery', 'energy': 0})
+        print(f"❌ Critical: {e}")
+        return jsonify({'error': str(e)}), 500
+
+def format_response(route, method, energy, dist_matrix):
+    # Ensure start at 0
+    if 0 in route:
+        idx_0 = route.index(0)
+        route = route[idx_0:] + route[:idx_0]
+    
+    # Calc energy if 0
+    if energy == 0:
+        for i in range(len(route)-1):
+            energy += dist_matrix[route[i]][route[i+1]]
+        energy += dist_matrix[route[-1]][route[0]]
+
+    print(f"✅ Success: {method}")
+    return jsonify({'route': route, 'method': method, 'energy': energy})
 
 if __name__ == '__main__':
-    print("--- SECURE BACKEND ONLINE ---")
-    app.run(port=5000, debug=True)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)

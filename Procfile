@@ -1,1 +1,1 @@
-web: gunicorn qaoa_backend:app
+web: gunicorn qaoa_backend:app --workers 1 --threads 2 --timeout 120
