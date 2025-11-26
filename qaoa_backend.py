@@ -75,9 +75,12 @@ def run_ibm_cloud_solver(dist_matrix):
     converter = QuadraticProgramToQubo()
     qubo = converter.convert(qp)
     operator, offset = qubo.to_ising()
-    ansatz = QAOAAnsatz(operator, reps=1)
     
-    # Connect
+    # 1. Build Circuit
+    ansatz = QAOAAnsatz(operator, reps=1)
+    ansatz.measure_all() # <--- CRITICAL FIX: Adds measurements to register 'meas'
+    
+    # 2. Connect
     try:
         service = QiskitRuntimeService(channel="ibm_quantum", token=IBM_TOKEN)
     except:
@@ -85,15 +88,16 @@ def run_ibm_cloud_solver(dist_matrix):
         
     backend = service.least_busy(operational=True, simulator=False)
     
-    # Light Optimization (Level 0 saves server RAM)
+    # 3. Transpile & Run
     t_circuit = transpile(ansatz, backend, optimization_level=0)
     sampler = IBMSampler(mode=backend)
     
-    # One-Shot Execution
     pub = (t_circuit, [np.random.rand(ansatz.num_parameters)])
     job = sampler.run([pub])
     result = job.result()
     
+    # 4. Decode
+    # Now 'meas' exists because we called measure_all()
     pub_result = result[0]
     counts = pub_result.data.meas.get_counts()
     best_bitstring = max(counts, key=counts.get)
@@ -116,13 +120,13 @@ def run_local_simulator(dist_matrix):
     converter = QuadraticProgramToQubo()
     qubo = converter.convert(qp)
     operator, offset = qubo.to_ising()
+    
     ansatz = QAOAAnsatz(operator, reps=1)
+    ansatz.measure_all() # <--- CRITICAL FIX: Adds measurements
     
     sampler = LocalSampler()
-    # Use backend=None for local
     t_circuit = transpile(ansatz, backend=None, optimization_level=0)
     
-    # Simulate
     job = sampler.run([(t_circuit, [np.random.rand(ansatz.num_parameters)])])
     result = job.result()
     
@@ -147,7 +151,6 @@ def background_worker(job_id, locations, solver_mode):
         # STRICT MODE SELECTION
         try:
             if solver_mode == 'cloud':
-                # Try D-Wave first (Faster), then IBM
                 try:
                     route, method = run_dwave_solver(dist_matrix)
                 except Exception as dwave_err:
@@ -155,16 +158,13 @@ def background_worker(job_id, locations, solver_mode):
                     route, method = run_ibm_cloud_solver(dist_matrix)
                     
             elif solver_mode == 'local':
-                # Strictly Local - No Cloud checks here
                 route, method = run_local_simulator(dist_matrix)
                 
             else:
-                # Fallback/Browser mode handled by frontend usually, but just in case
                 raise Exception(f"Unknown solver mode: {solver_mode}")
 
         except Exception as quantum_err:
             print(f"Quantum failed ({solver_mode}): {quantum_err}")
-            # CLASSICAL FALLBACK
             print("⚠️ Falling back to Classical Greedy")
             G = nx.from_numpy_array(dist_matrix)
             route = nx.approximation.greedy_tsp(G, source=0)
@@ -195,7 +195,7 @@ def background_worker(job_id, locations, solver_mode):
 def start_solve():
     data = request.json
     locations = data.get('locations', [])
-    solver_mode = data.get('solver_mode', 'local') # Crucial: Receive the mode!
+    solver_mode = data.get('solver_mode', 'local') 
     
     if len(locations) < 2: return jsonify({'error': 'Need 2+ locations'}), 400
 
