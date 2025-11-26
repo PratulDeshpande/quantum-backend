@@ -1,5 +1,6 @@
 import json
 import os
+import gc
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -56,11 +57,13 @@ class ISA_Transpiler_Wrapper:
     def run(self, pubs):
         transpiled_pubs = []
         for pub in pubs:
+            # MEMORY FIX: Reduced optimization_level from 3 to 1
+            # Level 3 is too heavy for free tier RAM
             if isinstance(pub, tuple):
-                t_circuit = transpile(pub[0], self.backend, optimization_level=3)
+                t_circuit = transpile(pub[0], self.backend, optimization_level=1)
                 transpiled_pubs.append((t_circuit,) + pub[1:])
             else:
-                transpiled_pubs.append(transpile(pub, self.backend, optimization_level=3))
+                transpiled_pubs.append(transpile(pub, self.backend, optimization_level=1))
         return self.sampler.run(transpiled_pubs)
 
 def get_ibm_service(token):
@@ -84,6 +87,9 @@ def solve_with_dwave(dist_matrix):
 
 def solve_with_ibm_cloud(dist_matrix):
     print("☁️ IBM Cloud...")
+    # MEMORY FIX: Explicit garbage collection before heavy tasks
+    gc.collect()
+    
     tsp = Tsp(dist_matrix)
     qp = tsp.to_quadratic_program()
     
@@ -91,7 +97,7 @@ def solve_with_ibm_cloud(dist_matrix):
     backend = service.least_busy(operational=True, simulator=False)
     print(f"Target: {backend.name}")
     
-    optimizer = COBYLA(maxiter=1) # Keep strictly 1 for speed/cost
+    optimizer = COBYLA(maxiter=1) 
     raw_sampler = IBMSampler(mode=backend)
     sampler = ISA_Transpiler_Wrapper(backend, raw_sampler)
     
@@ -100,15 +106,15 @@ def solve_with_ibm_cloud(dist_matrix):
     result = algo.solve(qp)
     
     x = tsp.interpret(result)
+    gc.collect() # Clean up after
     return list(x), f"Real QPU ({backend.name})", result.fval
 
 def solve_with_local_sim(dist_matrix):
     print("💻 Local Simulator...")
+    gc.collect()
     tsp = Tsp(dist_matrix)
     qp = tsp.to_quadratic_program()
     
-    # MEMORY SAVING SETTINGS:
-    # 1. Low iterations (20 is enough for demo, 100 kills memory)
     optimizer = COBYLA(maxiter=20) 
     sampler = LocalSampler()
     qaoa = QAOA(sampler, optimizer, reps=1)
@@ -116,6 +122,7 @@ def solve_with_local_sim(dist_matrix):
     result = algo.solve(qp)
     
     x = tsp.interpret(result)
+    gc.collect()
     return list(x), "Local Qiskit Simulator", result.fval
 
 @app.route('/solve', methods=['POST'])
@@ -142,8 +149,9 @@ def solve_tsp():
                 print(f"D-Wave Failed: {e}")
 
         # 2. IBM CLOUD (Real Hardware)
-        # We allow up to 4 nodes because the processing happens on THEIR cloud, not our RAM.
-        if QISKIT_AVAILABLE and IBM_TOKEN and num_nodes <= 4:
+        # MEMORY FIX: We previously limited this to 3.
+        # UPDATE: Change 3 to 4 to allow 4-node problems on Cloud.
+        if QISKIT_AVAILABLE and IBM_TOKEN and num_nodes <= 4:  # <--- CHANGE THIS FROM 3 TO 4
             try:
                 route, method, energy = solve_with_ibm_cloud(dist_matrix)
                 return format_response(route, method, energy, dist_matrix)
@@ -151,8 +159,7 @@ def solve_tsp():
                 print(f"IBM Cloud Failed: {e}")
 
         # 3. LOCAL SIMULATOR (The RAM Killer)
-        # CRITICAL: Strictly limit to 3 nodes on Free Tier RAM.
-        # 4 nodes creates a 16x16 matrix (2^16 states in complex space), often causing OOM.
+        # KEEP THIS AT 3. Your free server definitely cannot simulate 4 nodes locally.
         if QISKIT_AVAILABLE and num_nodes <= 3: 
             try:
                 route, method, energy = solve_with_local_sim(dist_matrix)
