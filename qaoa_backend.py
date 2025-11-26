@@ -1,6 +1,5 @@
 import json
 import os
-import gc
 import time
 import threading
 import uuid
@@ -18,11 +17,7 @@ DWAVE_TOKEN = os.getenv("DWAVE_TOKEN")
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# --- JOB STORAGE (Simple In-Memory Database) ---
-# Stores results: { "job_id": { "status": "pending" | "completed" | "failed", "data": ... } }
-jobs_db = {}
-
-# --- IMPORTS ---
+# --- IMPORTS (Safe Loading) ---
 QISKIT_AVAILABLE = False
 try:
     from qiskit import transpile
@@ -33,7 +28,7 @@ try:
     from qiskit.primitives import StatevectorSampler as LocalSampler
     QISKIT_AVAILABLE = True
 except ImportError:
-    print("⚠️ Qiskit not installed.")
+    print("⚠️ Qiskit not installed. (Cloud/Local Quantum disabled)")
 
 DWAVE_AVAILABLE = False
 try:
@@ -42,7 +37,10 @@ try:
     import dwave_networkx as dnx
     DWAVE_AVAILABLE = True
 except ImportError:
-    print("⚠️ D-Wave not installed.")
+    print("⚠️ D-Wave not installed. (Cloud Annealer disabled)")
+
+# --- JOB STORE ---
+jobs_db = {}
 
 def calculate_distance_matrix(locations):
     n = len(locations)
@@ -56,111 +54,155 @@ def calculate_distance_matrix(locations):
                 matrix[i][j] = dist
     return matrix
 
-# --- WORKER FUNCTION (Runs in Background) ---
-def background_worker(job_id, locations):
+# --- SOLVER FUNCTIONS ---
+
+def run_dwave_solver(dist_matrix):
+    if not (DWAVE_AVAILABLE and DWAVE_TOKEN):
+        raise Exception("D-Wave Token missing or library not installed.")
+    print("🌊 Executing on D-Wave Leap...")
+    sampler = LeapHybridSampler(token=DWAVE_TOKEN)
+    G = nx.from_numpy_array(dist_matrix)
+    route = dnx.traveling_salesperson(G, sampler)
+    return route, "D-Wave Quantum Annealer"
+
+def run_ibm_cloud_solver(dist_matrix):
+    if not (QISKIT_AVAILABLE and IBM_TOKEN):
+        raise Exception("IBM Token missing or Qiskit not installed.")
+    print("☁️ Executing on IBM Quantum Cloud...")
+    
+    tsp = Tsp(dist_matrix)
+    qp = tsp.to_quadratic_program()
+    converter = QuadraticProgramToQubo()
+    qubo = converter.convert(qp)
+    operator, offset = qubo.to_ising()
+    ansatz = QAOAAnsatz(operator, reps=1)
+    
+    # Connect
+    try:
+        service = QiskitRuntimeService(channel="ibm_quantum", token=IBM_TOKEN)
+    except:
+        service = QiskitRuntimeService(channel="ibm_cloud", token=IBM_TOKEN)
+        
+    backend = service.least_busy(operational=True, simulator=False)
+    
+    # Light Optimization (Level 0 saves server RAM)
+    t_circuit = transpile(ansatz, backend, optimization_level=0)
+    sampler = IBMSampler(mode=backend)
+    
+    # One-Shot Execution
+    pub = (t_circuit, [np.random.rand(ansatz.num_parameters)])
+    job = sampler.run([pub])
+    result = job.result()
+    
+    pub_result = result[0]
+    counts = pub_result.data.meas.get_counts()
+    best_bitstring = max(counts, key=counts.get)
+    
+    x = np.array([int(bit) for bit in best_bitstring])
+    try:
+        route = tsp.interpret(x)
+    except:
+        route = list(range(len(dist_matrix))) # Noise Fallback
+        
+    return list(route), f"Real QPU ({backend.name})"
+
+def run_local_simulator(dist_matrix):
+    if not QISKIT_AVAILABLE:
+        raise Exception("Qiskit not installed.")
+    print("💻 Executing on Local Qiskit Simulator...")
+    
+    tsp = Tsp(dist_matrix)
+    qp = tsp.to_quadratic_program()
+    converter = QuadraticProgramToQubo()
+    qubo = converter.convert(qp)
+    operator, offset = qubo.to_ising()
+    ansatz = QAOAAnsatz(operator, reps=1)
+    
+    sampler = LocalSampler()
+    # Use backend=None for local
+    t_circuit = transpile(ansatz, backend=None, optimization_level=0)
+    
+    # Simulate
+    job = sampler.run([(t_circuit, [np.random.rand(ansatz.num_parameters)])])
+    result = job.result()
+    
+    pub_result = result[0]
+    counts = pub_result.data.meas.get_counts()
+    best_bitstring = max(counts, key=counts.get)
+    
+    x = np.array([int(bit) for bit in best_bitstring])
+    route = tsp.interpret(x)
+    return list(route), "Local Qiskit Simulator"
+
+# --- MAIN WORKER LOGIC ---
+def background_worker(job_id, locations, solver_mode):
     try:
         num_nodes = len(locations)
         dist_matrix = calculate_distance_matrix(locations)
+        route = []
+        method = ""
         
-        # STRATEGY 1: D-WAVE
-        if DWAVE_AVAILABLE and DWAVE_TOKEN:
-            try:
-                print(f"Job {job_id}: Sending to D-Wave...")
-                sampler = LeapHybridSampler(token=DWAVE_TOKEN)
-                G = nx.from_numpy_array(dist_matrix)
-                route = dnx.traveling_salesperson(G, sampler)
-                save_result(job_id, route, "D-Wave Quantum Annealer", dist_matrix)
-                return
-            except Exception as e:
-                print(f"D-Wave Failed: {e}")
+        print(f"Job {job_id}: Starting Mode [{solver_mode}]")
 
-        # STRATEGY 2: IBM ONE-SHOT
-        if QISKIT_AVAILABLE and IBM_TOKEN and num_nodes <= 4:
-            try:
-                print(f"Job {job_id}: Sending to IBM Cloud...")
-                tsp = Tsp(dist_matrix)
-                qp = tsp.to_quadratic_program()
-                
-                # Fix: Convert constrained QP to unconstrained QUBO
-                converter = QuadraticProgramToQubo()
-                qubo = converter.convert(qp)
-                operator, offset = qubo.to_ising()
-                
-                ansatz = QAOAAnsatz(operator, reps=1)
-                
-                service = QiskitRuntimeService(channel="ibm_quantum", token=IBM_TOKEN)
-                backend = service.least_busy(operational=True, simulator=False)
-                
-                # Optimization level 0 saves backend RAM
-                t_circuit = transpile(ansatz, backend, optimization_level=0)
-                sampler = IBMSampler(mode=backend)
-                
-                # Run Job
-                pub = (t_circuit, [np.random.rand(ansatz.num_parameters)])
-                job = sampler.run([pub])
-                result = job.result() # This blocks thread, but not main server!
-                
-                pub_result = result[0]
-                counts = pub_result.data.meas.get_counts()
-                best_bitstring = max(counts, key=counts.get)
-                
-                x = np.array([int(bit) for bit in best_bitstring])
+        # STRICT MODE SELECTION
+        try:
+            if solver_mode == 'cloud':
+                # Try D-Wave first (Faster), then IBM
                 try:
-                    route = tsp.interpret(x)
-                except:
-                    route = list(range(len(dist_matrix)))
+                    route, method = run_dwave_solver(dist_matrix)
+                except Exception as dwave_err:
+                    print(f"D-Wave skipped: {dwave_err}")
+                    route, method = run_ibm_cloud_solver(dist_matrix)
+                    
+            elif solver_mode == 'local':
+                # Strictly Local - No Cloud checks here
+                route, method = run_local_simulator(dist_matrix)
                 
-                save_result(job_id, list(route), f"Real QPU ({backend.name})", dist_matrix)
-                return
-            except Exception as e:
-                print(f"IBM Failed: {e}")
+            else:
+                # Fallback/Browser mode handled by frontend usually, but just in case
+                raise Exception(f"Unknown solver mode: {solver_mode}")
 
-        # STRATEGY 3: FALLBACK
-        print(f"Job {job_id}: Using Classical Fallback")
-        G = nx.from_numpy_array(dist_matrix)
-        route = nx.approximation.greedy_tsp(G, source=0)
-        save_result(job_id, route, "Classical Greedy (Fallback)", dist_matrix)
+        except Exception as quantum_err:
+            print(f"Quantum failed ({solver_mode}): {quantum_err}")
+            # CLASSICAL FALLBACK
+            print("⚠️ Falling back to Classical Greedy")
+            G = nx.from_numpy_array(dist_matrix)
+            route = nx.approximation.greedy_tsp(G, source=0)
+            method = f"Classical Fallback (Quantum Failed)"
 
+        # Calculate Energy & Format
+        if 0 in route:
+            idx_0 = route.index(0)
+            route = route[idx_0:] + route[:idx_0]
+            
+        energy = 0
+        for i in range(len(route)-1):
+            energy += dist_matrix[route[i]][route[i+1]]
+        energy += dist_matrix[route[-1]][route[0]]
+        
+        jobs_db[job_id] = {
+            "status": "completed",
+            "result": { "route": route, "method": method, "energy": energy }
+        }
+        print(f"Job {job_id} Finished via {method}")
+        
     except Exception as e:
-        print(f"Job {job_id} Failed: {e}")
+        print(f"Critical Job Error: {e}")
         jobs_db[job_id] = {"status": "failed", "error": str(e)}
 
-def save_result(job_id, route, method, dist_matrix):
-    # Normalize route
-    if 0 in route:
-        idx_0 = route.index(0)
-        route = route[idx_0:] + route[:idx_0]
-    
-    # Calculate energy
-    energy = 0
-    for i in range(len(route)-1):
-        energy += dist_matrix[route[i]][route[i+1]]
-    energy += dist_matrix[route[-1]][route[0]]
-    
-    jobs_db[job_id] = {
-        "status": "completed",
-        "result": {
-            "route": route,
-            "method": method,
-            "energy": energy
-        }
-    }
-    print(f"Job {job_id} Completed!")
-
 # --- ENDPOINTS ---
-
 @app.route('/solve', methods=['POST'])
 def start_solve():
     data = request.json
     locations = data.get('locations', [])
+    solver_mode = data.get('solver_mode', 'local') # Crucial: Receive the mode!
     
     if len(locations) < 2: return jsonify({'error': 'Need 2+ locations'}), 400
 
-    # Generate ID and start background thread
     job_id = str(uuid.uuid4())
     jobs_db[job_id] = {"status": "pending"}
     
-    thread = threading.Thread(target=background_worker, args=(job_id, locations))
+    thread = threading.Thread(target=background_worker, args=(job_id, locations, solver_mode))
     thread.start()
     
     return jsonify({"job_id": job_id, "status": "pending"})
@@ -168,9 +210,7 @@ def start_solve():
 @app.route('/status/<job_id>', methods=['GET'])
 def get_status(job_id):
     job = jobs_db.get(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-        
+    if not job: return jsonify({"error": "Job not found"}), 404
     return jsonify(job)
 
 if __name__ == '__main__':
